@@ -17,6 +17,8 @@ except ImportError:
     sys.exit(1)
 
 console = Console()
+notation = "Rp "
+PAGE_SIZE = 10
 
 
 def show_help():
@@ -48,7 +50,7 @@ Average (Mean)
   Add all your expenses, divide by count.
 
   Problem:
-    One large purchase (like $200) can distort this heavily.
+    One large purchase (like {notation200) can distort this heavily.
 
   Use it for:
     General sense of spending level.
@@ -243,6 +245,51 @@ Runway
     )
 
 
+def colorize(value, good=None, warn=None, reverse=False, is_percent=False):
+    """
+    Generic color function
+    good: threshold for green
+    warn: threshold for yellow
+    reverse: if True, lower is better (e.g. error)
+    """
+    if value is None:
+        return "[dim]N/A[/]"
+
+    v = value * 100 if is_percent else value
+
+    if reverse:
+        if v <= good:
+            color = "green"
+        elif v <= warn:
+            color = "yellow"
+        else:
+            color = "red"
+    else:
+        if v >= good:
+            color = "green"
+        elif v >= warn:
+            color = "yellow"
+        else:
+            color = "red"
+
+    return f"[{color}]{value:.2f}{'%' if is_percent else ''}[/]"
+
+
+def paginate(transactions, page, show_all):
+    if show_all:
+        return transactions, 1, 1
+
+    total = len(transactions)
+    total_pages = max(1, math.ceil(total / PAGE_SIZE))
+
+    page = max(1, min(page, total_pages))
+
+    start = (page - 1) * PAGE_SIZE
+    end = start + PAGE_SIZE
+
+    return transactions[start:end], page, total_pages
+
+
 def parse_date(date_str):
     parts = date_str.strip().split("/")
     if len(parts) == 2:
@@ -316,6 +363,12 @@ def parse_file(filename):
             price = float(price_str.replace("+", ""))
             name = parts[1]
             description = parts[2] if len(parts) > 2 else ""
+            tag = None
+
+            if "#" in description:
+                parts_desc = description.rsplit("#", 1)
+                description = parts_desc[0].strip()
+                tag = parts_desc[1].strip().lower()
 
             transactions.append(
                 {
@@ -325,6 +378,7 @@ def parse_file(filename):
                     "price": price,
                     "name": name,
                     "description": description,
+                    "tag": tag,
                     "is_income": is_income,
                 }
             )
@@ -396,11 +450,50 @@ def calculate_stats(transactions):
         )
 
         # Purchase categories
-        stats["impulse_buys"] = sum(1 for x in expense_amounts if x < 5)
+        stats["impulse_buys"] = sum(1 for x in expense_amounts if x < 20)
         stats["big_purchases"] = sum(1 for x in expense_amounts if x >= 50)
 
         stats["max_expense"] = max(expenses, key=lambda x: x["price"])
         stats["min_expense"] = min(expenses, key=lambda x: x["price"])
+
+        # --- Reliability Metrics ---
+
+        # Standard Error (how stable the mean is)
+        stats["stderr"] = stats["stddev_expense"] / math.sqrt(n) if n > 1 else 0
+
+        # 95% Confidence Interval for mean (approx, assumes normal-ish data)
+        ci_margin = 1.96 * stats["stderr"] if n > 1 else 0
+        stats["ci_low"] = mean - ci_margin
+        stats["ci_high"] = mean + ci_margin
+
+        # Relative error (how big the uncertainty is vs mean)
+        stats["relative_error"] = (stats["stderr"] / mean * 100) if mean > 0 else 0
+
+        # Median-Mean gap (skew / instability signal)
+        stats["mean_median_gap"] = abs(mean - stats["median"])
+
+        # Sample size quality
+        if n < 5:
+            stats["sample_quality"] = "very_low"
+        elif n < 15:
+            stats["sample_quality"] = "low"
+        elif n < 30:
+            stats["sample_quality"] = "moderate"
+        else:
+            stats["sample_quality"] = "good"
+
+        # --- Outlier detection (IQR method) ---
+        q1 = stats["p25"]
+        q3 = stats["p75"]
+        iqr = stats["iqr"]
+
+        lower_bound = q1 - 1.5 * iqr
+        upper_bound = q3 + 1.5 * iqr
+
+        outliers = [x for x in expense_amounts if x < lower_bound or x > upper_bound]
+
+        stats["outlier_count"] = len(outliers)
+        stats["outlier_ratio"] = (len(outliers) / n * 100) if n > 0 else 0
 
     # Advanced finance stats
     if len(daily_expense_values) > 0:
@@ -429,7 +522,7 @@ def calculate_stats(transactions):
     return stats
 
 
-def display_transactions(transactions, initial_balance, limit):
+def display_transactions(transactions, initial_balance, limit, show_tag=True):
     """Display transaction table with before:after balance"""
     table = Table(
         title="[bold yellow]TRANSACTION LOG[/]",
@@ -444,6 +537,8 @@ def display_transactions(transactions, initial_balance, limit):
     table.add_column("Amount", width=12, justify="right")
     table.add_column("Name", width=16)
     table.add_column("Desc", width=20)
+    if show_tag:
+        table.add_column("Tag", width=10)
     table.add_column("Balance", width=14, justify="center")
 
     balance = initial_balance
@@ -455,9 +550,9 @@ def display_transactions(transactions, initial_balance, limit):
 
         # Amount formatting
         if t["is_income"]:
-            amt_str = f"[bold green]+${t['price']:.2f}[/]"
+            amt_str = f"[bold green]+{notation}{t['price']:.2f}[/]"
         else:
-            amt_str = f"[red]-${t['price']:.2f}[/]"
+            amt_str = f"[red]-{notation}{t['price']:.2f}[/]"
 
         # Balance color based on status
         if after < 0:
@@ -480,7 +575,23 @@ def display_transactions(transactions, initial_balance, limit):
         )
         desc = f"[dim italic]{desc}[/]" if desc else ""
 
-        table.add_row(str(i), t["date_str"], amt_str, name, desc, bal_str)
+        # Tags
+        tag_str = f"[magenta]{t['tag']}[/]" if t.get("tag") else ""
+
+        row = [
+            str(i),
+            t["date_str"],
+            amt_str,
+            name,
+            desc,
+        ]
+
+        if show_tag:
+            row.append(tag_str)
+
+        row.append(bal_str)
+
+        table.add_row(*row)
 
     console.print()
     console.print(table)
@@ -531,14 +642,16 @@ def display_bar_graph(transactions, initial_balance, width=40):
             bal_style = "green"
 
         lines.append(
-            f"[blue]{date_str:<7}[/] {exp_bar} [white]${vals['expense']:<6.0f}[/] → [{bal_style}]${balance:.0f}[/]"
+            f"[blue]{date_str:<7}[/] {exp_bar} [white]{notation}{vals['expense']:<6.0f}[/] → [{bal_style}]{notation}{balance:.0f}[/]"
         )
 
         # Income bar (if any)
         if vals["income"] > 0:
             inc_len = int((vals["income"] / max_val) * width)
             inc_bar = "[green]" + "█" * inc_len + "[/]"
-            lines.append(f"[dim]{'':>7}[/] {inc_bar} [green]+${vals['income']:.0f}[/]")
+            lines.append(
+                f"[dim]{'':>7}[/] {inc_bar} [green]+{notation}{vals['income']:.0f}[/]"
+            )
 
     # Add legend
     lines.append("")
@@ -556,13 +669,13 @@ def display_bar_graph(transactions, initial_balance, width=40):
     console.print(panel)
 
 
-def display_stats(stats, initial_balance, final_balance, limit):
+def display_stats(stats, initial_balance, final_balance, limit, hide_right=False):
     """Display statistics panel"""
 
     # Left column - Balance info
     left_rows = [
-        ("Starting Balance", f"[white]${initial_balance:.2f}[/]"),
-        ("Final Balance", f"[bold white]${final_balance:.2f}[/]"),
+        ("Starting Balance", f"[white]{notation}{initial_balance:.2f}[/]"),
+        ("Final Balance", f"[bold white]{notation}{final_balance:.2f}[/]"),
     ]
 
     if limit:
@@ -576,17 +689,20 @@ def display_stats(stats, initial_balance, final_balance, limit):
         else:
             limit_style = "green"
 
-        left_rows.append(("Budget Limit", f"[white]${limit:.2f}[/]"))
+        left_rows.append(("Budget Limit", f"[white]{notation}{limit:.2f}[/]"))
         left_rows.append(
-            ("Remaining", f"[{limit_style}]${remaining:.2f} ({100 - pct_used:.0f}%)[/]")
+            (
+                "Remaining",
+                f"[{limit_style}]{notation}{remaining:.2f} ({100 - pct_used:.0f}%)[/]",
+            )
         )
 
     left_rows.extend(
         [
             ("", ""),
-            ("Total Spent", f"[red]${stats.get('total_spent', 0):.2f}[/]"),
-            ("Total Earned", f"[green]${stats.get('total_earned', 0):.2f}[/]"),
-            ("Net Change", f"[bold]${stats.get('net_change', 0):.2f}[/]"),
+            ("Total Spent", f"[red]{notation}{stats.get('total_spent', 0):.2f}[/]"),
+            ("Total Earned", f"[green]{notation}{stats.get('total_earned', 0):.2f}[/]"),
+            ("Net Change", f"[bold]{notation}{stats.get('net_change', 0):.2f}[/]"),
         ]
     )
 
@@ -599,14 +715,87 @@ def display_stats(stats, initial_balance, final_balance, limit):
         ("Days Tracked", str(stats.get("total_days", 0))),
     ]
 
+    right_rows.extend(
+        [
+            ("", ""),
+            (
+                "SE",
+                colorize(
+                    stats["stderr"],
+                    good=stats["avg_expense"] * 0.1,
+                    warn=stats["avg_expense"] * 0.3,
+                    reverse=True,
+                ),
+            ),
+            (
+                "95% CI",
+                f"[cyan]{notation}{stats['ci_low']:.2f} - {notation}{stats['ci_high']:.2f}[/]",
+            ),
+            (
+                "Rel Error",
+                colorize(
+                    stats["relative_error"],
+                    good=10,
+                    warn=30,
+                    reverse=True,
+                    is_percent=True,
+                ),
+            ),
+            (
+                "Mean-Median Gap",
+                colorize(
+                    stats["mean_median_gap"],
+                    good=stats["stddev_expense"] * 0.3,
+                    warn=stats["stddev_expense"],
+                    reverse=True,
+                ),
+            ),
+            (
+                "Sample Quality",
+                (
+                    "[green]good[/]"
+                    if stats["sample_quality"] == "good"
+                    else "[yellow]mid[/]"
+                    if stats["sample_quality"] == "moderate"
+                    else "[orange1]bad[/]"
+                    if stats["sample_quality"] == "low"
+                    else "[red]foul[/]"
+                ),
+            ),
+            (
+                "Outliers",
+                colorize(
+                    stats["outlier_ratio"],
+                    good=5,
+                    warn=15,
+                    reverse=True,
+                    is_percent=True,
+                ),
+            ),
+        ]
+    )
     if "avg_expense" in stats:
         right_rows.extend(
             [
                 ("", ""),
-                ("Avg Expense", f"${stats['avg_expense']:.2f}"),
-                ("Median", f"${stats['median']:.2f}"),
-                ("Std Dev", f"${stats['stddev_expense']:.2f}"),
-                ("Volatility", f"{stats['volatility']:.1f}%"),
+                ("Avg Expense", f"{notation}{stats['avg_expense']:.2f}"),
+                (
+                    "Median",
+                    f"[white]{notation}{stats['median']:.2f}[/]"
+                    if stats["mean_median_gap"] < stats["stddev_expense"]
+                    else f"[yellow]{notation}{stats['median']:.2f}[/]",
+                ),
+                ("Std Dev", f"{notation}{stats['stddev_expense']:.2f}"),
+                (
+                    "Volatility",
+                    colorize(
+                        stats["volatility"],
+                        good=20,
+                        warn=50,
+                        reverse=True,
+                        is_percent=True,
+                    ),
+                ),
             ]
         )
     if "savings_rate" in stats:
@@ -615,7 +804,7 @@ def display_stats(stats, initial_balance, final_balance, limit):
                 ("", ""),
                 ("Savings Rate", f"{stats['savings_rate']:.1f}%"),
                 ("Expense Ratio", f"{stats['expense_ratio']:.1f}%"),
-                ("Burn Rate", f"${stats['burn_rate']:.2f}/day"),
+                ("Burn Rate", f"{notation}{stats['burn_rate']:.2f}/day"),
             ]
         )
     if "max_expense" in stats:
@@ -626,11 +815,11 @@ def display_stats(stats, initial_balance, final_balance, limit):
                 ("", ""),
                 (
                     "Highest",
-                    f"[red]${max_e['price']:.2f}[/] [dim]({max_e['name'][:10]})[/]",
+                    f"[red]{notation}{max_e['price']:.2f}[/] [dim]({max_e['name'][:10]})[/]",
                 ),
                 (
                     "Lowest",
-                    f"[green]${min_e['price']:.2f}[/] [dim]({min_e['name'][:10]})[/]",
+                    f"[green]{notation}{min_e['price']:.2f}[/] [dim]({min_e['name'][:10]})[/]",
                 ),
             ]
         )
@@ -647,7 +836,7 @@ def display_stats(stats, initial_balance, final_balance, limit):
                 ("IQR Spread", f"{stats['iqr']:.2f}"),
                 ("Skewness", f"{stats['skew']:.2f}"),
                 ("", ""),
-                ("Impulse Buys <5", f"{stats['impulse_buys']}"),
+                ("Impulse Buys <20", f"{stats['impulse_buys']}"),
                 ("Big Purchases >50", f"{stats['big_purchases']}"),
                 (
                     "Days over average",
@@ -680,7 +869,11 @@ def display_stats(stats, initial_balance, final_balance, limit):
             right_table.add_row(label, value)
 
     # Combine into panel
-    columns = Columns([left_table, right_table], padding=4, expand=True)
+
+    if hide_right:  # shit i thought its hide-left, its hide-right.
+        columns = Columns([left_table], padding=4, expand=True)
+    else:
+        columns = Columns([left_table, right_table], padding=4, expand=True)
     panel = Panel(
         columns,
         title="[bold yellow]STATISTICS[/]",
@@ -699,14 +892,14 @@ def display_warnings(final_balance, limit, stats):
 
     if final_balance < 0:
         warnings.append(
-            f"[bold red]⚠ NEGATIVE BALANCE:[/] [red]${final_balance:.2f}[/]"
+            f"[bold red]⚠ NEGATIVE BALANCE:[/] [red]{notation}{final_balance:.2f}[/]"
         )
 
     if limit:
         spent = stats.get("total_spent", 0)
         if spent > limit:
             warnings.append(
-                f"[bold red]⚠ OVER BUDGET[/] by [red]${spent - limit:.2f}[/]"
+                f"[bold red]⚠ OVER BUDGET[/] by [red]{notation}{spent - limit:.2f}[/]"
             )
         elif spent > limit * 0.9:
             warnings.append(f"[yellow]⚠ Warning:[/] 90%+ of budget used")
@@ -727,13 +920,28 @@ def display_warnings(final_balance, limit, stats):
         console.print()
         console.print(panel)
 
+    # -- Reliability Warning --
+    if stats.get("sample_quality") == "very_low":
+        warnings.append("[yellow]⚠ Very low sample size → stats unreliable[/]")
+    elif stats.get("sample_quality") == "low":
+        warnings.append("[yellow]⚠ Low sample size → interpret cautiously[/]")
+
+    if stats.get("relative_error", 0) > 50:
+        warnings.append("[yellow]⚠ High uncertainty in mean (high standard error)[/]")
+
+    if stats.get("mean_median_gap", 0) > stats.get("stddev_expense", 0):
+        warnings.append("[yellow]⚠ Mean far from median → skewed data[/]")
+
+    if stats.get("outlier_ratio", 0) > 20:
+        warnings.append("[yellow]⚠ Many outliers → unstable distribution[/]")
+
 
 def display_header(filename, initial_balance, limit, count):
     """Display header"""
     info = f"[white]File:[/] {filename}\n"
-    info += f"[white]Balance:[/] [green]${initial_balance:.2f}[/]"
+    info += f"[white]Balance:[/] [green]{notation}{initial_balance:.2f}[/]"
     if limit:
-        info += f"  [dim]|[/]  [white]Limit:[/] [yellow]${limit:.2f}[/]"
+        info += f"  [dim]|[/]  [white]Limit:[/] [yellow]{notation}{limit:.2f}[/]"
     info += f"\n[white]Transactions:[/] {count}"
 
     panel = Panel(
@@ -745,6 +953,34 @@ def display_header(filename, initial_balance, limit, count):
     )
     console.print()
     console.print(panel)
+
+
+def parse_args(argv):
+    page = 1
+    show_all = True
+    tag_filter = None
+    no_stat = False
+
+    for arg in argv[2:]:
+        if arg.startswith("p-"):
+            val = arg[2:]
+
+            if val == "all":
+                show_all = True
+            else:
+                try:
+                    page = int(val)
+                    show_all = False  # ← ONLY paginate if number is given
+                except:
+                    pass
+
+        elif arg.startswith("t-"):
+            tag_filter = arg[2:].lower()
+
+        elif arg == "--nostat":
+            no_stat = True
+
+    return page, show_all, tag_filter, no_stat
 
 
 def main():
@@ -781,13 +1017,25 @@ def main():
         console.print("[bold red]Error:[/] No transactions found.")
         sys.exit(1)
 
-    # Display
-    display_header(filename, initial_balance, limit, len(transactions))
-    final_balance = display_transactions(transactions, initial_balance, limit)
+    page, show_all, tag_filter, no_stat = parse_args(sys.argv)
+
+    if tag_filter:
+        transactions = [t for t in transactions if t.get("tag") == tag_filter]
+
+    paged_tx, current_page, total_pages = paginate(transactions, page, show_all)
+
+    console.print(f"[dim]Page {current_page}/{total_pages}[/]\n")
+
+    final_balance = display_transactions(
+        paged_tx,
+        initial_balance,
+        limit,
+        show_tag=True,  # <--- THIS enforces tags!
+    )
     display_bar_graph(transactions, initial_balance)
 
     stats = calculate_stats(transactions)
-    display_stats(stats, initial_balance, final_balance, limit)
+    display_stats(stats, initial_balance, final_balance, limit, hide_right=no_stat)
     display_warnings(final_balance, limit, stats)
 
     console.print()
