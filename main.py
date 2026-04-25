@@ -1,5 +1,6 @@
 import sys
 import os
+import re
 import math
 from datetime import datetime
 from collections import defaultdict
@@ -363,13 +364,16 @@ def parse_file(filename):
             price = float(price_str.replace("+", ""))
             name = parts[1]
             description = parts[2] if len(parts) > 2 else ""
-            tag = None
 
-            if "#" in description:
-                parts_desc = description.rsplit("#", 1)
-                description = parts_desc[0].strip()
-                tag = parts_desc[1].strip().lower()
+            # Extract all tags (words starting with #)
+            tags = re.findall(r"#(\w+)", description)
 
+            # Clean description (remove tags)
+            description = re.sub(r"#\w+", "", description).strip()
+
+            # Normalize tags
+            tags = [tag.lower() for tag in tags] if tags else None
+            print(tags)
             transactions.append(
                 {
                     "date": current_date,
@@ -378,7 +382,7 @@ def parse_file(filename):
                     "price": price,
                     "name": name,
                     "description": description,
-                    "tag": tag,
+                    "tag": tags,  # now a list
                     "is_income": is_income,
                 }
             )
@@ -530,6 +534,7 @@ def display_transactions(transactions, initial_balance, limit, show_tag=True):
         header_style="bold cyan",
         show_lines=False,
         padding=(0, 1),
+        expand=True
     )
 
     table.add_column("#", style="dim", width=4, justify="right")
@@ -576,7 +581,8 @@ def display_transactions(transactions, initial_balance, limit, show_tag=True):
         desc = f"[dim italic]{desc}[/]" if desc else ""
 
         # Tags
-        tag_str = f"[magenta]{t['tag']}[/]" if t.get("tag") else ""
+        tag = t.get("tag")  # note: you renamed it earlier
+        tag_str = f"[magenta]{', '.join(tag)}[/]" if tag else ""
 
         row = [
             str(i),
@@ -958,7 +964,7 @@ def display_header(filename, initial_balance, limit, count):
 def parse_args(argv):
     page = 1
     show_all = True
-    tag_filter = None
+    tag_filters = None  # now a list
     no_stat = False
 
     for arg in argv[2:]:
@@ -970,17 +976,20 @@ def parse_args(argv):
             else:
                 try:
                     page = int(val)
-                    show_all = False  # ← ONLY paginate if number is given
+                    show_all = False
                 except:
                     pass
 
         elif arg.startswith("t-"):
-            tag_filter = arg[2:].lower()
+            raw = arg[2:].lower()
+
+            # support: t-a,b,c
+            tag_filters = [t.strip() for t in raw.split(",") if t.strip()]
 
         elif arg == "--nostat":
             no_stat = True
 
-    return page, show_all, tag_filter, no_stat
+    return page, show_all, tag_filters, no_stat
 
 
 def main():
@@ -1017,10 +1026,13 @@ def main():
         console.print("[bold red]Error:[/] No transactions found.")
         sys.exit(1)
 
-    page, show_all, tag_filter, no_stat = parse_args(sys.argv)
+    page, show_all, tag_filters, no_stat = parse_args(sys.argv)
 
-    if tag_filter:
-        transactions = [t for t in transactions if t.get("tag") == tag_filter]
+    if tag_filters:
+        transactions = [
+            t for t in transactions
+            if t.get("tag") and any(tag in t["tag"] for tag in tag_filters)
+        ]
 
     paged_tx, current_page, total_pages = paginate(transactions, page, show_all)
 
